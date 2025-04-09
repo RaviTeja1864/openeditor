@@ -1,26 +1,33 @@
 import os
 import streamlit as st
-from dotenv import load_dotenv
 from PyPDF2 import PdfReader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from langchain.docstore.document import Document
 from langchain_community.vectorstores import FAISS
-from langchain.chains.question_answering import load_qa_chain
-from langchain.prompts import PromptTemplate
-import google.generativeai as genai
+from sentence_transformers import SentenceTransformer
+from typing import List
+from groq import Groq
 
-# === Load environment variables ===
-load_dotenv(dotenv_path=".env")
+# === Streamlit UI Setup ===
+st.set_page_config(page_title="PDF Chat (Groq + LLaMA 4)", layout="wide")
+st.title("📄 Chat with your PDF using LLaMA 4 Maverick (Groq)")
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-GOOGLE_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+# === Embedding Wrapper Compatible with LangChain ===
+class SentenceEmbeddingFunction:
+    def __init__(self, model_name="all-MiniLM-L6-v2"):
+        self.model = SentenceTransformer(model_name)
+        self.dim = len(self.model.encode("test", convert_to_tensor=False))
 
-if not GOOGLE_API_KEY or not GOOGLE_CREDENTIALS:
-    raise EnvironmentError("❌ Please check your .env file. GOOGLE_API_KEY or GOOGLE_APPLICATION_CREDENTIALS is missing.")
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        return self.model.encode(texts, convert_to_tensor=False).tolist()
 
-# Configure API access
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = GOOGLE_CREDENTIALS
-genai.configure(api_key=GOOGLE_API_KEY)
+    def embed_query(self, text: str) -> List[float]:
+        return self.model.encode(text, convert_to_tensor=False).tolist()
+
+    def __call__(self, text: str) -> List[float]:
+        return self.embed_query(text)
+
+embedding_function = SentenceEmbeddingFunction()
 
 # === PDF Utilities ===
 def extract_text_from_pdfs(pdf_docs):
@@ -28,66 +35,92 @@ def extract_text_from_pdfs(pdf_docs):
     for pdf in pdf_docs:
         reader = PdfReader(pdf)
         for page in reader.pages:
-            text += page.extract_text() or ""
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text
     return text
 
 def split_text_into_chunks(text):
-    splitter = RecursiveCharacterTextSplitter(chunk_size=10000, chunk_overlap=1000)
-    return splitter.split_text(text)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+    chunks = splitter.split_text(text)
+    return [Document(page_content=chunk) for chunk in chunks]
 
 def create_vector_store(chunks):
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    vector_store = FAISS.from_texts(chunks, embedding=embeddings)
+    vector_store = FAISS.from_documents(chunks, embedding=embedding_function)
     vector_store.save_local("faiss_index")
 
 def load_vector_store():
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    return FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
+    return FAISS.load_local("faiss_index", embeddings=embedding_function, allow_dangerous_deserialization=True)
 
-def build_qa_chain():
-    prompt_template = """
-    Answer the question based on the provided context.
-    If the answer is not available, say "The answer is not available in the context."
+# === Groq Chat Completion ===
+def get_llama4_answer(query, context):
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        st.error("❌ GROQ_API_KEY not found in environment variables!")
+        return "Please set your Groq API key."
 
-    Context:
-    {context}
+    client = Groq(api_key=api_key)
 
-    Question:
-    {question}
+    messages = [
+        {
+            "role": "system",
+            "content": "You're a helpful assistant that answers based only on the provided context.",
+        },
+        {
+            "role": "user",
+            "content": f"Answer the following based on the context below:\n\nContext:\n{context}\n\nQuestion: {query}"
+        }
+    ]
 
-    Answer:
-    """
-    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
-    model = ChatGoogleGenerativeAI(model="models/chat-bison-001", temperature=0.3)
-    return load_qa_chain(model, chain_type="stuff", prompt=prompt)
+    try:
+        chat_completion = client.chat.completions.create(
+            messages=messages,
+            model="meta-llama/llama-4-maverick-17b-128e-instruct",
+            temperature=0.7,
+            max_tokens=1000,
+        )
+        return chat_completion.choices[0].message.content.strip()
 
+    except Exception as e:
+        st.error(f"❌ Error calling Groq API: {e}")
+        return "Failed to get response from Groq API."
+
+# === Query Handler ===
 def answer_user_query(query):
     db = load_vector_store()
-    relevant_docs = db.similarity_search(query)
-    chain = build_qa_chain()
-    result = chain({"input_documents": relevant_docs, "question": query}, return_only_outputs=True)
-    st.write("📌 **Answer:**", result["output_text"])
+    docs = db.similarity_search(query, k=3)
 
-# === Streamlit UI ===
+    if not docs:
+        st.error("❌ No relevant content found in the PDFs.")
+        return
+
+    context = "\n\n".join([doc.page_content for doc in docs])
+
+    with st.spinner("💬 Generating answer from LLaMA 4..."):
+        answer = get_llama4_answer(query, context)
+        st.markdown("### 🧠 Answer from LLaMA 4:")
+        st.success(answer)
+
+# === Main App ===
 def main():
-    st.set_page_config(page_title="Chat with your PDF")
-    st.header("📄 Chat with your PDF using Google AI")
-
     query = st.text_input("💬 Ask a question about your PDFs:")
 
     if query:
-        answer_user_query(query)
+        if os.path.exists("faiss_index/index.faiss"):
+            answer_user_query(query)
+        else:
+            st.warning("⚠️ Please upload and process PDFs first!")
 
     with st.sidebar:
-        st.title("📂 Upload your PDFs")
-        pdf_files = st.file_uploader("Upload PDF files", accept_multiple_files=True)
+        st.header("📂 Upload PDFs")
+        pdf_files = st.file_uploader("Upload PDF files", accept_multiple_files=True, type=["pdf"])
         if st.button("✅ Submit & Process"):
             if pdf_files:
                 with st.spinner("Processing PDFs..."):
-                    text = extract_text_from_pdfs(pdf_files)
-                    chunks = split_text_into_chunks(text)
+                    raw_text = extract_text_from_pdfs(pdf_files)
+                    chunks = split_text_into_chunks(raw_text)
                     create_vector_store(chunks)
-                    st.success("✅ PDFs processed and indexed!")
+                    st.success("✅ PDFs processed and indexed successfully!")
             else:
                 st.warning("⚠️ Please upload at least one PDF.")
 
