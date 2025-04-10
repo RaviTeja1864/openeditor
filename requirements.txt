@@ -6,4 +6,3 @@ PyPDF2
 chromadb
 faiss-cpu
 langchain_google_genaipip
-GOOGLE_APPLICATION_CREDENTIALS=C:/Users/teja3/Downloads/chatbot-456220-1d07d8d715be.json
